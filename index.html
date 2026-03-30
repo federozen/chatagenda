@@ -717,16 +717,16 @@ function buildWelcome() {
   }).slice(0,8).join(' &nbsp;·&nbsp; ');
 
   cont.innerHTML = `
-    <p>¡Hola! Tengo cargada la agenda de la semana del <strong>${weeks[0] ? formatDate(weeks[0]) : '—'}</strong> al <strong>${weeks[weeks.length-1] ? formatDate(weeks[weeks.length-1]) : '—'}</strong>.</p>
+    <p>¡Hola! Soy tu asistente deportivo con IA 🤖 Tengo cargada la agenda del <strong>${weeks[0] ? formatDate(weeks[0]) : '—'}</strong> al <strong>${weeks[weeks.length-1] ? formatDate(weeks[weeks.length-1]) : '—'}</strong>.</p>
     <p style="margin-top:8px;color:var(--muted);font-size:13px">${sportTags}</p>
-    <p style="margin-top:12px">Preguntame lo que quieras. Por ejemplo:</p>
+    <p style="margin-top:12px">Preguntame lo que quieras en lenguaje natural. Por ejemplo:</p>
     <div class="chips-row" style="margin-top:10px">
-      <span class="chip" onclick="quickQuery('fútbol del domingo')">⚽ Fútbol del domingo</span>
-      <span class="chip" onclick="quickQuery('F1 esta semana')">🏎️ F1</span>
-      <span class="chip" onclick="quickQuery('Argentina')">🇦🇷 Argentina</span>
-      <span class="chip" onclick="quickQuery('qué hay hoy')">📅 Qué hay hoy</span>
-      <span class="chip" onclick="quickQuery('tenis')">🎾 Tenis</span>
-      <span class="chip" onclick="quickQuery('todo el lunes')">Todo el lunes</span>
+      <span class="chip" onclick="quickQuery('¿Qué partidos de fútbol hay el domingo?')">⚽ Fútbol del domingo</span>
+      <span class="chip" onclick="quickQuery('¿A qué hora es la F1?')">🏎️ Horario F1</span>
+      <span class="chip" onclick="quickQuery('¿Cuándo juega Argentina?')">🇦🇷 Argentina</span>
+      <span class="chip" onclick="quickQuery('¿Qué hay para ver hoy?')">📅 Qué hay hoy</span>
+      <span class="chip" onclick="quickQuery('¿Hay superposición de horarios el sábado?')">⚠️ Superposiciones</span>
+      <span class="chip" onclick="quickQuery('¿Qué deportes hay esta semana?')">🏆 Resumen semana</span>
     </div>
   `;
   return cont;
@@ -735,6 +735,99 @@ function buildWelcome() {
 function quickQuery(q) {
   document.getElementById('userInput').value = q;
   sendMessage();
+}
+
+// ========================
+// CONVERSATION HISTORY
+// ========================
+let chatHistory = [];
+
+// ========================
+// AI LAYER — Claude API
+// ========================
+async function askClaude(userQuery) {
+  const today = new Date().toISOString().split('T')[0];
+  const weekDates = getWeekDates(agendaData.events);
+
+  // Build a compact agenda summary for the system prompt
+  // Group events by date for readability
+  const agendaLines = [];
+  const byDate = {};
+  agendaData.events.forEach(e => {
+    if (!byDate[e.fecha]) byDate[e.fecha] = [];
+    byDate[e.fecha].push(e);
+  });
+
+  for (const [fecha, evs] of Object.entries(byDate).sort()) {
+    const d = new Date(fecha + 'T12:00:00');
+    const dayName = d.toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' });
+    agendaLines.push(`\n--- ${dayName.toUpperCase()} ---`);
+    for (const ev of evs) {
+      const teams = (ev.local && ev.visitante && ev.local !== 'nan' && ev.visitante !== 'nan')
+        ? `${ev.local} vs. ${ev.visitante}` : (ev.info || ev.torneo || '');
+      const hora = String(ev.horario).replace(' hs.','').trim();
+      agendaLines.push(`[${hora}] ${ev.deporte} | ${ev.torneo} | ${teams} | Canal: ${ev.canal} | Fuente: ${ev.fuente}`);
+    }
+  }
+
+  const systemPrompt = `Sos un asistente experto en deportes para un usuario argentino. Tu tarea es responder preguntas sobre la agenda deportiva televisiva de la semana.
+
+HOY es: ${today}
+SEMANA DISPONIBLE: ${weekDates[0]} al ${weekDates[weekDates.length-1]}
+
+AGENDA COMPLETA:
+${agendaLines.join('\n')}
+
+INSTRUCCIONES:
+- Respondé siempre en español rioplatense (vos, dale, etc.)
+- Cuando el usuario pregunte por eventos, devolvé un JSON con este formato EXACTO (sin markdown, sin explicación extra, solo el JSON):
+{
+  "text": "respuesta conversacional breve",
+  "event_ids": [lista de índices numéricos de los eventos relevantes de la agenda, basados en orden de aparición 0-indexed]
+}
+- Si la pregunta no tiene eventos asociados (ej: "¿cuántos partidos hay?", "¿qué deportes hay?"), devolvé solo texto:
+{
+  "text": "tu respuesta aquí",
+  "event_ids": []
+}
+- Podés hacer recomendaciones, comparar horarios, explicar torneos, sugerir qué ver si hay superposición de horarios, etc.
+- Si te preguntan qué canal ver, indicá el número SD o HD si está disponible.
+- Siempre respondé en JSON válido.`;
+
+  // Build messages with history
+  const messages = [
+    ...chatHistory,
+    { role: 'user', content: userQuery }
+  ];
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: systemPrompt,
+      messages
+    })
+  });
+
+  const data = await response.json();
+  const rawText = data.content?.map(c => c.text || '').join('') || '';
+
+  // Update history
+  chatHistory.push({ role: 'user', content: userQuery });
+  chatHistory.push({ role: 'assistant', content: rawText });
+  // Keep last 10 turns to avoid token overflow
+  if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
+
+  // Parse response
+  try {
+    const clean = rawText.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(clean);
+    return parsed;
+  } catch(e) {
+    return { text: rawText, event_ids: [] };
+  }
 }
 
 // ========================
@@ -747,37 +840,59 @@ async function sendMessage() {
   input.value = '';
 
   appendMsg('user', query);
-  showTyping();
-  await new Promise(r => setTimeout(r, 400));
-  removeTyping();
 
   if (!agendaData.events.length) {
     appendMsg('bot', '⚠️ Todavía no hay agenda cargada. Hacé clic en <strong>⬆ Subir semana</strong> para cargar los archivos Excel.');
     return;
   }
 
-  const { results } = searchEvents(query);
+  showTyping();
 
-  if (!results.length) {
-    const bubble = document.createElement('div');
-    bubble.innerHTML = `No encontré eventos que coincidan con "<em>${query}</em>". Probá con otro deporte, equipo o día.`;
-    const chips = document.createElement('div');
-    chips.className = 'chips-row';
-    chips.style.marginTop = '10px';
-    ['todo el fin de semana','fútbol','F1','básquet'].forEach(s => {
-      const c = document.createElement('span');
-      c.className = 'chip';
-      c.textContent = s;
-      c.onclick = () => quickQuery(s);
-      chips.appendChild(c);
-    });
-    bubble.appendChild(chips);
-    appendMsg('bot', bubble);
-  } else {
-    const content = document.createElement('div');
-    content.appendChild(buildMatchCards(results));
-    appendMsg('bot', content);
+  let aiResponse;
+  try {
+    aiResponse = await askClaude(query);
+  } catch(err) {
+    removeTyping();
+    // Fallback to keyword search
+    const { results } = searchEvents(query);
+    if (!results.length) {
+      appendMsg('bot', `No encontré eventos para "<em>${query}</em>". Probá con otro deporte, equipo o día.`);
+    } else {
+      const content = document.createElement('div');
+      content.appendChild(buildMatchCards(results));
+      appendMsg('bot', content);
+    }
+    return;
   }
+
+  removeTyping();
+
+  // Build response: AI text + matching event cards
+  const content = document.createElement('div');
+
+  // AI text
+  if (aiResponse.text) {
+    const textDiv = document.createElement('div');
+    textDiv.style.marginBottom = aiResponse.event_ids?.length ? '12px' : '0';
+    // Simple markdown-like: **bold**
+    textDiv.innerHTML = aiResponse.text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    content.appendChild(textDiv);
+  }
+
+  // Event cards if any
+  if (aiResponse.event_ids && aiResponse.event_ids.length > 0) {
+    // Get events by index from full list
+    const allEvents = agendaData.events;
+    const selectedEvents = aiResponse.event_ids
+      .map(i => allEvents[i])
+      .filter(Boolean);
+
+    if (selectedEvents.length > 0) {
+      content.appendChild(buildMatchCards(selectedEvents));
+    }
+  }
+
+  appendMsg('bot', content);
 }
 
 // ========================
@@ -852,6 +967,7 @@ async function processFiles() {
     saveData(agendaData);
     document.getElementById('weekLabel').textContent = weekLabel;
     pendingFiles = [];
+    chatHistory = []; // Reset AI conversation history
     closeModal();
     // Announce
     const area = document.getElementById('chatArea');
